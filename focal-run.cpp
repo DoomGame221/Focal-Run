@@ -22,6 +22,7 @@ enum class BuildSystem {
     Ninja,
     MinGW,
     GCC,
+    Rust,
     Auto
 };
 
@@ -52,6 +53,8 @@ private:
     std::mutex outputMutex;
     std::unordered_map<std::string, std::string> configCache;
     std::unordered_map<std::string, std::unordered_set<std::string>> dependencyGraph;
+    bool rustMode = false;
+    std::string cargoCommand = "build";
 
     // ตรวจสอบว่า command มีอยู่ในระบบหรือไม่
     bool isCommandAvailable(const std::string& cmd) {
@@ -165,6 +168,13 @@ private:
         std::string cacheKey = proj.path + "_generator";
         std::string detected;
 
+        // สำหรับ Rust projects ใช้ Cargo
+        if (proj.buildSystem == BuildSystem::Rust) {
+            proj.detectedGenerator = "Cargo";
+            configCache[cacheKey] = proj.detectedGenerator;
+            return;
+        }
+
         // ตรวจสอบ cache ก่อน
         if (configCache.count(cacheKey)) {
             detected = configCache[cacheKey];
@@ -214,6 +224,14 @@ public:
         std::cout << "  --check                   Check if required build tools are available" << std::endl;
         std::cout << "  --help, -h                Show this help message" << std::endl << std::endl;
 
+        std::cout << "RUST SPECIFIC COMMANDS:" << std::endl;
+        std::cout << "  --rust                    Filter to only Rust projects" << std::endl;
+        std::cout << "  --test                    Run cargo test (Rust projects)" << std::endl;
+        std::cout << "  --doc                     Generate documentation with cargo doc" << std::endl;
+        std::cout << "  --run                     Run the project with cargo run" << std::endl;
+        std::cout << "  --check                   Check the project with cargo check" << std::endl;
+        std::cout << "  --bench                   Run benchmarks with cargo bench" << std::endl << std::endl;
+
         std::cout << "BUILD OPTIONS:" << std::endl;
         std::cout << "  --debug                   Build in Debug mode (default: Release)" << std::endl;
         std::cout << "  --release                 Build in Release mode" << std::endl;
@@ -254,6 +272,12 @@ public:
         std::cout << "  # Clean specific project" << std::endl;
         std::cout << "  focal-run.exe --MyProject --clean\n" << std::endl;
 
+        std::cout << "  # Build all Rust projects" << std::endl;
+        std::cout << "  focal-run.exe --rust --all\n" << std::endl;
+
+        std::cout << "  # Test all Rust projects" << std::endl;
+        std::cout << "  focal-run.exe --rust --test --all\n" << std::endl;
+
         std::cout << "PROJECT NAMING:" << std::endl;
         std::cout << "  Use --<folder_name> to specify a project (e.g., --MyProject)" << std::endl;
         std::cout << "  Omit --all to build only specified project, include --all for all projects\n" << std::endl;
@@ -264,11 +288,13 @@ public:
         std::cout << "  2. MinGW Makefiles (Windows)" << std::endl;
         std::cout << "  3. Ninja" << std::endl;
         std::cout << "  4. Unix Makefiles (Linux/Mac)" << std::endl;
-        std::cout << "  5. Visual Studio (Windows fallback)\n" << std::endl;
+        std::cout << "  5. Visual Studio (Windows fallback)" << std::endl;
+        std::cout << "  6. Cargo (Rust projects)\n" << std::endl;
 
         std::cout << "NOTES:" << std::endl;
-        std::cout << "  - Each project must have a CMakeLists.txt or Makefile file" << std::endl;
+        std::cout << "  - Each project must have a CMakeLists.txt, Makefile, or Cargo.toml file" << std::endl;
         std::cout << "  - Build directory will be created at: <project_path>/build (for CMake projects)" << std::endl;
+        std::cout << "  - Rust projects use Cargo's default target directory" << std::endl;
         std::cout << "  - Use --rebuild to delete old build directory before building" << std::endl;
         std::cout << "  - Dependencies are automatically resolved from add_subdirectory() calls" << std::endl;
         std::cout << "  - Configuration is cached in .focal-run-cache for faster subsequent runs" << std::endl;
@@ -295,6 +321,12 @@ public:
             else if (arg == "--debug") buildType = "Debug";
             else if (arg == "--release") buildType = "Release";
             else if (arg == "--verbose") verboseMode = true;
+            else if (arg == "--rust") rustMode = true;
+            else if (arg == "--test") cargoCommand = "test";
+            else if (arg == "--doc") cargoCommand = "doc";
+            else if (arg == "--run") cargoCommand = "run";
+            else if (arg == "--check") cargoCommand = "check";
+            else if (arg == "--bench") cargoCommand = "bench";
             else if (arg == "--scan") {
                 scanProjects();
                 printProjects();
@@ -326,6 +358,7 @@ public:
             // Check CMakeLists.txt in current directory
             std::string currentCMake = actualPath + "/CMakeLists.txt";
             std::string currentMakefile = actualPath + "/Makefile";
+            std::string currentCargo = actualPath + "/Cargo.toml";
 
             if (fs::exists(currentCMake)) {
                 std::string projectName = fs::absolute(actualPath).filename().string();
@@ -356,6 +389,32 @@ public:
                 proj.detectedGenerator = "Make";
 
                 projects.push_back(proj);
+            } else if (fs::exists(currentCargo)) {
+
+                std::string projectName = fs::absolute(actualPath).filename().string();
+
+                if (projectName.empty() || projectName == ".") {
+
+                    projectName = "RootProject";
+
+                }
+
+                ProjectInfo proj;
+
+                proj.name = projectName;
+
+                proj.path = fs::absolute(actualPath).string();
+
+                proj.buildType = buildType;
+
+                proj.buildSystem = BuildSystem::Rust;
+
+                proj.isMakefileProject = false;
+
+                proj.detectedGenerator = "Cargo";
+
+                projects.push_back(proj);
+
             }
 
             // สแกนโฟลเดอร์ย่อยแบบ recursive
@@ -403,6 +462,36 @@ public:
                         proj.detectedGenerator = "Make";
 
                         projects.push_back(proj);
+                    } else if (filename == "Cargo.toml") {
+
+                        std::string projectDir = entry.path().parent_path().string();
+
+                        std::string projectName = fs::path(projectDir).filename().string();
+
+                        // ข้ามถ้าเป็นโปรเจกต์ที่พบในโฟลเดอร์ปัจจุบันแล้ว
+
+                        if (projectDir == fs::absolute(actualPath).string()) {
+
+                            continue;
+
+                        }
+
+                        ProjectInfo proj;
+
+                        proj.name = projectName;
+
+                        proj.path = projectDir;
+
+                        proj.buildType = buildType;
+
+                        proj.buildSystem = BuildSystem::Rust;
+
+                        proj.isMakefileProject = false;
+
+                        proj.detectedGenerator = "Cargo";
+
+                        projects.push_back(proj);
+
                     }
                 }
             }
@@ -432,6 +521,69 @@ public:
                 exit(1);
             }
         }
+
+        if (rustMode) {
+            projects.erase(std::remove_if(projects.begin(), projects.end(),
+                [](const ProjectInfo& p) { return p.buildSystem != BuildSystem::Rust; }), projects.end());
+        }
+    }
+    bool buildRustProject(ProjectInfo& proj) {
+        // If clean mode for Rust projects
+        if (cleanMode) {
+            std::string cleanCmd = "cd \"" + proj.path + "\" && cargo clean";
+            if (verboseMode) {
+                std::cout << "  [VERBOSE] Cleaning: " << cleanCmd << std::endl;
+            }
+
+            auto startTime = std::chrono::high_resolution_clock::now();
+            int cleanResult = system(verboseMode ? cleanCmd.c_str() : (cleanCmd + " >nul 2>&1").c_str());
+            auto endTime = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+
+            if (verboseMode) {
+                std::cout << "  [VERBOSE] Clean took: " << duration.count() << "ms" << std::endl;
+            }
+
+            if (cleanResult != 0) {
+                std::cerr << "  Clean failed!" << std::endl;
+                if (!verboseMode) {
+                    system(cleanCmd.c_str()); // Show error output
+                }
+                return false;
+            }
+            return true;
+        }
+
+        // Build Rust project
+        std::string buildCmd = "cd \"" + proj.path + "\" && cargo " + cargoCommand;
+        if (cargoCommand == "build" || cargoCommand == "test" || cargoCommand == "bench" || cargoCommand == "check") {
+            if (buildType == "Release") {
+                buildCmd += " --release";
+            }
+        }
+
+        if (verboseMode) {
+            std::cout << "  [VERBOSE] Building: " << buildCmd << std::endl;
+        }
+
+        auto startTime = std::chrono::high_resolution_clock::now();
+        int buildResult = system(verboseMode ? buildCmd.c_str() : (buildCmd + " >nul 2>&1").c_str());
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+
+        if (verboseMode) {
+            std::cout << "  [VERBOSE] Build took: " << duration.count() << "ms" << std::endl;
+        }
+
+        if (buildResult != 0) {
+            std::cerr << "  Build failed!" << std::endl;
+            if (!verboseMode) {
+                system(buildCmd.c_str()); // Show error output
+            }
+            return false;
+        }
+
+        return true;
     }
 
     bool buildProject(ProjectInfo& proj) {
@@ -440,6 +592,11 @@ public:
         // Handle Makefile projects differently
         if (proj.isMakefileProject) {
             return buildMakefileProject(proj);
+        }
+
+        // Handle Rust projects
+        if (proj.buildSystem == BuildSystem::Rust) {
+            return buildRustProject(proj);
         }
 
         // Detect and configure build system for CMake projects
@@ -761,7 +918,9 @@ public:
             {"make", "Make"},
             {"ninja", "Ninja"},
             {"mingw32-make", "MinGW Make"},
-            {"g++", "GCC C++ Compiler"}
+            {"g++", "GCC C++ Compiler"},
+            {"rustc", "Rust Compiler"},
+            {"cargo", "Cargo Package Manager"}
         };
 
         int availableCount = 0;
